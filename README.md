@@ -1,5 +1,24 @@
 # AI Git Diff Service
 
+## Authentication
+
+Set the service's bearer token in the environment before starting it:
+
+```bash
+export API_BEARER_TOKEN="replace-with-a-long-random-token"
+fastapi dev
+```
+
+Send that token on every `/v1/*` request in the `Authorization` header:
+
+```bash
+curl http://127.0.0.1:8000/v1/jobs \
+  -H "Authorization: Bearer replace-with-a-long-random-token"
+```
+
+`/health` and `/spec` remain public. In `/docs`, click **Authorize** and enter
+the token value without the `Bearer` prefix.
+
 # Plan
 
 Build a small authenticated HTTP service around an asynchronous review-job pipeline, using Python 3.12 and FastAPI. Keep the mock provider deterministic and independent from the optional LLM provider so the contract, ordering, streaming, caching, and failure handling are all testable locally before deployment; package it as a single container and deploy it to a managed container host.
