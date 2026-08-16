@@ -1,35 +1,21 @@
 import os
 import secrets
+from src.errors import APIError
 from pydantic import BaseModel, Field
 from time import monotonic
 from typing import Annotated, Literal
 from dotenv import load_dotenv
 from fastapi import APIRouter, Depends, FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from src.checkDiff import parse_diff
 
 load_dotenv()
 
+MAX_PAYLOAD_BYTES = 1_048_576
 SERVICE_VERSION = "0.1.0"
 START_TIME = monotonic()
-ERROR_STATUS = {
-    "unauthorized": 401,
-    "payload_too_large": 413,
-    "invalid_json": 400,
-    "invalid_diff": 422,
-    "idempotency_conflict": 409,
-    "not_found": 404,
-    "rate_limited": 429,
-    "internal": 500,
-}
-
-class APIError(Exception):
-    def __init__(self, code: str, message: str, *, headers: dict[str, str] | None = None) -> None:
-        super().__init__(message) # so that the exection can keep the error msg
-        self.code = code
-        self.message = message
-        self.status_code = ERROR_STATUS[code]
-        self.headers = headers or {}
 
 app = FastAPI(version=SERVICE_VERSION)
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -41,8 +27,7 @@ class ReviewOptions(BaseModel):
 
 # Validation for request
 class ReviewRequest(BaseModel):
-    diff: str = Field(min_length=1, default="")
-    provider: Literal["mock", "llm"] = "mock"
+    diff: str = Field(min_length=1)
     options: ReviewOptions = Field(default_factory=ReviewOptions) # used default factory so that each req get a clean obj
 
 @app.exception_handler(APIError)
@@ -51,6 +36,25 @@ async def ApiErrorHandler(request : Request, exc : APIError):
         status_code=exc.status_code,
         content={"error": {"code": exc.code, "message": exc.message}},
         headers=exc.headers,
+    )
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    del request
+    errors = exc.errors()
+    if any(e.get("type") == "json_invalid" for e in errors):
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"code": "invalid_json", "message": "Request body is not valid JSON."}},
+        )
+    message = (
+        "diff is required and must be a non-empty string."
+        if any("diff" in e.get("loc", ()) for e in errors)
+        else "Invalid request body."
+    )
+    return JSONResponse(
+        status_code=422,
+        content={"error": {"code": "invalid_diff", "message": message}},
     )
 
 # check for bearer token and compare it with the ones in env. Raised an error when the token is not the same or empty token
@@ -97,7 +101,10 @@ async def list_jobs():
     return{"Jobs" : []}
 
 @v1_router.post("/reviews", status_code=202, tags=["Operations"])
-async def create_jobs(JobsReceived: ReviewRequest) -> dict:
-    return{"Status" : "Created"}
+async def create_review(request: Request, payload: ReviewRequest) -> dict:
+    if len(await request.body()) > MAX_PAYLOAD_BYTES:
+        raise APIError("payload_too_large", "Request body exceeds 1 MiB.")
+    parse_diff(payload.diff)
+    return {"Status": "Created"}
 
 app.include_router(v1_router)
