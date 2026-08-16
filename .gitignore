@@ -1,2 +1,4 @@
 README.md
-CANDIDATE-TASK.md
+CANDIDATES-TASK.md
+*.pyc
+.env
