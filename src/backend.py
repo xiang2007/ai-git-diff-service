@@ -8,16 +8,31 @@ from fastapi import APIRouter, Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
+load_dotenv()
+
 SERVICE_VERSION = "0.1.0"
 START_TIME = monotonic()
+ERROR_STATUS = {
+    "unauthorized": 401,
+    "payload_too_large": 413,
+    "invalid_json": 400,
+    "invalid_diff": 422,
+    "idempotency_conflict": 409,
+    "not_found": 404,
+    "rate_limited": 429,
+    "internal": 500,
+}
 
-load_dotenv()
+class APIError(Exception):
+    def __init__(self, code: str, message: str, *, headers: dict[str, str] | None = None) -> None:
+        super().__init__(message) # so that the exection can keep the error msg
+        self.code = code
+        self.message = message
+        self.status_code = ERROR_STATUS[code]
+        self.headers = headers or {}
 
 app = FastAPI(version=SERVICE_VERSION)
 bearer_scheme = HTTPBearer(auto_error=False)
-
-class AuthenticationError(Exception):
-    "Raised when a request does not supply the configured API token."
 
 # Validation for options
 class ReviewOptions(BaseModel):
@@ -30,20 +45,15 @@ class ReviewRequest(BaseModel):
     provider: Literal["mock", "llm"] = "mock"
     options: ReviewOptions = Field(default_factory=ReviewOptions) # used default factory so that each req get a clean obj
 
-@app.exception_handler(AuthenticationError)
-async def authentication_error_handler(request: Request, exc: AuthenticationError) -> JSONResponse:
-    del request, exc
+@app.exception_handler(APIError)
+async def ApiErrorHandler(request : Request, exc : APIError):
     return JSONResponse(
-        status_code=401,
-        content={
-            "error": {
-                "code": "unauthorized",
-                "message": "A valid bearer token is required.",
-            }
-        },
-        headers={"WWW-Authenticate": "Bearer"},
+        status_code=exc.status_code,
+        content={"error": {"code": exc.code, "message": exc.message}},
+        headers=exc.headers,
     )
 
+# check for bearer token and compare it with the ones in env. Raised an error when the token is not the same or empty token
 async def require_bearer_token( credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)]) -> None:
     expected_token = os.getenv("API_BEARER_TOKEN")
     supplied_token = credentials.credentials if credentials is not None else ""
@@ -52,9 +62,9 @@ async def require_bearer_token( credentials: Annotated[HTTPAuthorizationCredenti
         or credentials is None
         or credentials.scheme.lower() != "bearer"
         or not secrets.compare_digest(supplied_token, expected_token)):
-        raise AuthenticationError
+        raise APIError("unauthorized", "A valid bearer token is required", headers={"WWW-Authenticate": "Bearer"})
 
-
+# adds v1 to the route, each v1 path is req to provide an bearer token
 v1_router = APIRouter(
     prefix="/v1",
     dependencies=[Depends(require_bearer_token)],
