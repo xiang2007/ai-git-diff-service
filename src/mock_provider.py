@@ -11,23 +11,48 @@ SQL_IN_STRING_RE = re.compile(r"""['"][^'"]*\b(?:SELECT|INSERT|UPDATE|DELETE)\b[
 INJECTION_PATTERNS = ("ignore previous instructions", "disregard all prior", "you are now")
 
 
-def _empty_catch(text: str, added: list[str], index: int) -> bool:
-    """True if an added `catch` line opens a block that is empty (possibly across lines)."""
-    match = re.search(r"\bcatch\b", text)
-    if not match:
+def _empty_catch(text: str, target_lines: list[str], index: int) -> bool:
+    """Return True when an added catch statement has an empty body."""
+    catch_match = re.search(r"\bcatch\b", text) # match the word catch
+    if not catch_match:
         return False
-    open_idx = text.find("{", match.start())
-    if open_idx == -1:
-        return False
-    body = text[open_idx + 1:]
-    i = index
-    while "}" not in body and i + 1 < len(added):
-        i += 1
-        body += "\n" + added[i]
-    close_idx = body.find("}")
-    if close_idx == -1:
-        return False
-    return body[:close_idx].strip() == ""
+    line_index = index
+    current_text = text
+    search_from = catch_match.end() # starts after catch "}catch(error){" '}' will get ignore
+    while True:
+        open_index = current_text.find("{", search_from)
+        if open_index != -1:
+            break
+        line_index += 1
+        if line_index >= len(target_lines):
+            return False
+        current_text = target_lines[line_index]
+        search_from = 0
+        # Before the opening brace, only blank lines are acceptable.
+        if current_text.strip() and not current_text.lstrip().startswith("{"):
+            return False
+    # Scan until the matching closing brace.
+    depth = 1
+    body_parts: list[str] = []
+    current_text = current_text[open_index + 1:]
+    while True:
+        for character in current_text:
+            if character == "{":
+                depth += 1
+                body_parts.append(character)
+            elif character == "}":
+                depth -= 1
+                if depth == 0:
+                    # if result after strip is empty, then MOCK-004
+                    return "".join(body_parts).strip() == ""
+                body_parts.append(character)
+            else:
+                body_parts.append(character)
+        line_index += 1
+        if line_index >= len(target_lines):
+            return False
+        body_parts.append("\n")
+        current_text = target_lines[line_index]
 
 
 MOCK_RULES = [
@@ -96,39 +121,50 @@ MOCK_RULES = [
     },
 ]
 
-
 def run_mock_provider(patch: PatchSet) -> list[dict]:
-    findings = []
-    for file in patch:
-        added_lines = []
-        for hunk in file:
-            for line in hunk:
-                if line.is_added:
-                    text = line.value.rstrip("\n")
-                    added_lines.append((line.target_line_no, text))
-        added_texts = [text for _, text in added_lines]
-        for index, (line_no, text) in enumerate(added_lines):
-            for rule in MOCK_RULES:
-                if rule["match"](text, added_texts, index):
-                    findings.append(
-                        {
-                            "id": f"{rule['id']}:{file.path}:{line_no}",
-                            "ruleId": rule["id"],
-                            "path": file.path,
-                            "line": line_no,
-                            "severity": rule["severity"],
-                            "category": rule["category"],
-                            "title": rule["title"],
-                            "evidence": text,
-                        }
-                    )
-
-    findings.sort(key=lambda f: (f["path"], f["line"], f["ruleId"]))
-
-    seen: set[str] = set()
-    unique = []
-    for finding in findings:
-        if finding["id"] not in seen:
-            seen.add(finding["id"])
-            unique.append(finding)
-    return unique
+    findings_by_id: dict[str, dict] = {}
+    for patched_file in patch:
+        for hunk in patched_file:
+            # Target-side lines consist of additions and unchanged context.
+            # Removed lines do not exist in the resulting file.
+            target_lines = [
+                line.value.rstrip("\r\n")
+                for line in hunk
+                if not line.is_removed
+            ]
+            target_line_numbers = [
+                line.target_line_no
+                for line in hunk
+                if not line.is_removed
+            ]
+            added_flags = [
+                line.is_added
+                for line in hunk
+                if not line.is_removed
+            ]
+            for index, text in enumerate(target_lines):
+                # Rules only apply to added lines.
+                if not added_flags[index]:
+                    continue
+                line_no = target_line_numbers[index]
+                for rule in MOCK_RULES:
+                    if not rule["match"](text, target_lines, index):
+                        continue
+                    finding_id = f"{rule['id']}:{patched_file.path}:{line_no}"
+                    findings_by_id[finding_id] = {
+                        "id": finding_id,
+                        "ruleId": rule["id"],
+                        "path": patched_file.path,
+                        "line": line_no,
+                        "severity": rule["severity"],
+                        "category": rule["category"],
+                        "title": rule["title"],
+                        "evidence": text,
+                    }
+    findings = list(findings_by_id.values())
+    findings.sort(key=lambda finding: (
+        finding["path"],
+        finding["line"],
+        finding["ruleId"],
+    ))
+    return findings

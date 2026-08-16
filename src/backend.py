@@ -1,21 +1,27 @@
+import asyncio
+import logging
 import os
 import secrets
+from uuid import uuid4
 from src.errors import APIError
 from pydantic import BaseModel, Field
 from time import monotonic
 from typing import Annotated, Literal
 from dotenv import load_dotenv
-from fastapi import APIRouter, Depends, FastAPI, Request
+from fastapi import APIRouter, Depends, FastAPI, Request, BackgroundTasks
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from src.checkDiff import parse_diff
+from src.mock_provider import run_mock_provider
 
+logger = logging.getLogger(__name__)
 load_dotenv()
 
-MAX_PAYLOAD_BYTES = 1_048_576
+MAX_PAYLOAD_BYTES = 1048576
 SERVICE_VERSION = "0.1.0"
 START_TIME = monotonic()
+JOBS: dict[str, dict] = {}
 
 app = FastAPI(version=SERVICE_VERSION)
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -29,6 +35,20 @@ class ReviewOptions(BaseModel):
 class ReviewRequest(BaseModel):
     diff: str = Field(min_length=1)
     options: ReviewOptions = Field(default_factory=ReviewOptions) # used default factory so that each req get a clean obj
+
+async def process_review(jobs_id : str, patch, provider : str, max_finding : int) -> None:
+    job = JOBS[jobs_id]
+    job["status"] = "running"
+    try:
+        if provider == "mock":
+            all_findings = await asyncio.to_thread(run_mock_provider, patch)
+        else:
+            raise RuntimeError("LLM not configured") # haven't implemented llm
+        job["findings"] = all_findings[:max_finding] # truncate the ordered results
+        job["status"] = "done"
+    except Exception:
+        logger.exception("Review jobs %s failed", jobs_id)
+        job["status"] = "failed"
 
 @app.exception_handler(APIError)
 async def ApiErrorHandler(request : Request, exc : APIError):
@@ -101,10 +121,40 @@ async def list_jobs():
     return{"Jobs" : []}
 
 @v1_router.post("/reviews", status_code=202, tags=["Operations"])
-async def create_review(request: Request, payload: ReviewRequest) -> dict:
+async def create_review(request: Request, payload: ReviewRequest, Background_tasks : BackgroundTasks) -> dict:
     if len(await request.body()) > MAX_PAYLOAD_BYTES:
         raise APIError("payload_too_large", "Request body exceeds 1 MiB.")
-    parse_diff(payload.diff)
-    return {"Status": "Created"}
+    patch = parse_diff(payload.diff) # parse the unified diff
+    job_id = uuid4().hex
+    JOBS[job_id] = {
+        "jobId": job_id,
+        "status": "queued",
+        "findings": [],
+        "usage": {
+            "inputBytes": len(payload.diff.encode("utf-8")),
+            "chunks": 1,
+            "cacheHit": False,
+        },
+}
+    Background_tasks.add_task( # append task to thread
+        process_review,
+        job_id,
+        patch,
+        payload.options.provider,
+        payload.options.maxFindings,
+    )
+    return {"jobId": job_id, "status": "queued"}
+
+@v1_router.get("/reviews/{job_id}", tags=["Operations"])
+async def get_review(job_id: str) -> dict:
+    job = JOBS.get(job_id)
+
+    if job is None:
+        raise APIError(
+            "not_found",
+            "Review job was not found.",
+        )
+
+    return job
 
 app.include_router(v1_router)
