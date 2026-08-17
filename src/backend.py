@@ -1,4 +1,6 @@
 import asyncio
+import copy
+import hashlib
 import logging
 import os
 import secrets
@@ -8,10 +10,11 @@ from pydantic import BaseModel, Field
 from time import monotonic
 from typing import Annotated, Literal
 from dotenv import load_dotenv
-from fastapi import APIRouter, Depends, FastAPI, Request, BackgroundTasks
+from fastapi import APIRouter, Depends, FastAPI, Header, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from contextlib import asynccontextmanager
 from src.checkDiff import parse_diff
 from src.mock_provider import run_mock_provider
 from src.chunking import chunk_patch
@@ -19,12 +22,57 @@ from src.chunking import chunk_patch
 logger = logging.getLogger(__name__)
 load_dotenv()
 
+type JobItem = tuple[
+    str,   # job_id
+    list,  # chunks
+    str,   # provider
+    int,   # max_findings
+]
+
 MAX_PAYLOAD_BYTES = 1048576
 SERVICE_VERSION = "0.1.0"
 START_TIME = monotonic()
 JOBS: dict[str, dict] = {}
+JOB_QUEUE: asyncio.Queue[JobItem] = asyncio.Queue()
+RESULT_CACHE: dict[str, dict] = {}
+IDEMPOTENCY_KEYS: dict[str, tuple[str, str]] = {}
+JOB_REQUEST_HASHES: dict[str, str] = {}
 
-app = FastAPI(version=SERVICE_VERSION)
+async def worker() -> None:
+    while True:
+        job_id, chunks, provider, max_findings = await JOB_QUEUE.get()
+
+        try:
+            await process_review(
+                job_id,
+                chunks,
+                provider,
+                max_findings,
+            )
+        finally:
+            JOB_QUEUE.task_done()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    del app
+
+    workers = [
+        asyncio.create_task(worker())
+        for _ in range(4)
+    ]
+
+    try:
+        yield
+    finally:
+        for worker_task in workers:
+            worker_task.cancel()
+
+        await asyncio.gather(
+            *workers,
+            return_exceptions=True,
+        )
+
+app = FastAPI(version=SERVICE_VERSION, lifespan=lifespan)
 bearer_scheme = HTTPBearer(auto_error=False)
 
 # Validation for options
@@ -52,7 +100,18 @@ async def process_review(job_id : str, chunks : list, provider : str, max_findin
         allFindings.sort(key=lambda finding:(finding["path"], finding["line"], finding["ruleId"]))
         job["findings"] = allFindings[:max_finding]
         job["status"] = "done"
+
+        request_hash = JOB_REQUEST_HASHES.pop(job_id, None)
+        if request_hash is not None:
+            RESULT_CACHE[request_hash] = {
+                "findings": copy.deepcopy(allFindings),
+                "usage": {
+                    "inputBytes": job["usage"]["inputBytes"],
+                    "chunks": job["usage"]["chunks"],
+                },
+            }
     except Exception:
+        JOB_REQUEST_HASHES.pop(job_id, None)
         logger.exception("Review jobs %s failed", job_id)
         job["status"] = "failed"
 
@@ -128,9 +187,47 @@ async def list_jobs():
     return{"Jobs" : []}
 
 @v1_router.post("/reviews", status_code=202, tags=["Operations"])
-async def create_review(request: Request, payload: ReviewRequest, Background_tasks : BackgroundTasks) -> dict:
-    if len(await request.body()) > MAX_PAYLOAD_BYTES:
+async def create_review(
+    request: Request,
+    payload: ReviewRequest,
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+) -> dict:
+    raw_body = await request.body()
+    if len(raw_body) > MAX_PAYLOAD_BYTES:
         raise APIError("payload_too_large", "Request body exceeds 1 MiB.")
+
+    request_hash = hashlib.sha256(raw_body).hexdigest()
+
+    if idempotency_key is not None:
+        previous = IDEMPOTENCY_KEYS.get(idempotency_key)
+        if previous is not None:
+            previous_hash, previous_job_id = previous
+            if previous_hash != request_hash:
+                raise APIError(
+                    "idempotency_conflict",
+                    "Idempotency key was already used with a different request body.",
+                )
+            return {"jobId": previous_job_id, "status": "queued"}
+
+    cached_result = RESULT_CACHE.get(request_hash)
+    if cached_result is not None:
+        job_id = uuid4().hex
+        JOBS[job_id] = {
+            "jobId": job_id,
+            "status": "done",
+            "findings": copy.deepcopy(cached_result["findings"])[
+                :payload.options.maxFindings
+            ],
+            "usage": {
+                "inputBytes": cached_result["usage"]["inputBytes"],
+                "chunks": cached_result["usage"]["chunks"],
+                "cacheHit": True,
+            },
+        }
+        if idempotency_key is not None:
+            IDEMPOTENCY_KEYS[idempotency_key] = (request_hash, job_id)
+        return {"jobId": job_id, "status": "queued"}
+
     patch = parse_diff(payload.diff) # parse the unified diff
     chunks = chunk_patch(patch) # chunking
     job_id = uuid4().hex
@@ -144,12 +241,16 @@ async def create_review(request: Request, payload: ReviewRequest, Background_tas
             "cacheHit": False,
         },
     }
-    Background_tasks.add_task( # append task to thread
-        process_review,
-        job_id,
-        chunks,
-        payload.options.provider,
-        payload.options.maxFindings,
+    JOB_REQUEST_HASHES[job_id] = request_hash
+    if idempotency_key is not None:
+        IDEMPOTENCY_KEYS[idempotency_key] = (request_hash, job_id)
+    await JOB_QUEUE.put(
+        (
+            job_id,
+            chunks,
+            payload.options.provider,
+            payload.options.maxFindings,
+        )
     )
     return {"jobId": job_id, "status": "queued"}
 
