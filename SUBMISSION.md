@@ -11,11 +11,10 @@
 FastAPI service with a single authenticated API surface and an in-memory
 async job pipeline.
 
-- `/health` and `/spec` are public; every `/v1/*` route requires a bearer token
-  via a router-level dependency.
-- `POST /v1/reviews` validates the body, parses the diff with `unidiff`, chunks
+- `/health` and `/spec` are public, every `/v1/*` route requires a bearer token
+- `POST /v1/reviews` validates the body, parses the unified git diff with `unidiff`, chunks
   files on 64 KiB boundaries, and enqueues the job.
-- Four asyncio workers process jobs concurrently; a fifth job queues without
+- Four asyncio workers process jobs concurrently then a fifth job queues without
   failing.
 - Mock findings are deterministic; Gemini findings are validated against the
   actual added lines before being stored.
@@ -23,7 +22,7 @@ async job pipeline.
   in-memory event log.
 - Caching is keyed by the SHA-256 of the raw request body; idempotency keys map
   to a body hash and existing job id.
-- Deployment is a non-root, healthchecked container built with `uv`.
+- Deployment is a non-root container built and sync with `uv`.
 
 ## Provider design
 
