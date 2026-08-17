@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from src.checkDiff import parse_diff
 from src.mock_provider import run_mock_provider
+from src.chunking import chunk_patch
 
 logger = logging.getLogger(__name__)
 load_dotenv()
@@ -36,22 +37,28 @@ class ReviewRequest(BaseModel):
     diff: str = Field(min_length=1)
     options: ReviewOptions = Field(default_factory=ReviewOptions) # used default factory so that each req get a clean obj
 
-async def process_review(jobs_id : str, patch, provider : str, max_finding : int) -> None:
-    job = JOBS[jobs_id]
+async def process_review(job_id : str, chunks : list, provider : str, max_finding : int) -> None:
+    job = JOBS[job_id]
     job["status"] = "running"
     try:
-        if provider == "mock":
-            all_findings = await asyncio.to_thread(run_mock_provider, patch)
-        else:
+        if provider != "mock":
             raise RuntimeError("LLM not configured") # haven't implemented llm
-        job["findings"] = all_findings[:max_finding] # truncate the ordered results
+        findById: dict[str, dict] = {}
+        for chunk in chunks:
+            chunkFindings = await asyncio.to_thread(run_mock_provider, chunk)
+            for finding in chunkFindings:
+                findById[finding["id"]] = finding
+        allFindings = list(findById.values())
+        allFindings.sort(key=lambda finding:(finding["path"], finding["line"], finding["ruleId"]))
+        job["findings"] = allFindings[:max_finding]
         job["status"] = "done"
     except Exception:
-        logger.exception("Review jobs %s failed", jobs_id)
+        logger.exception("Review jobs %s failed", job_id)
         job["status"] = "failed"
 
 @app.exception_handler(APIError)
 async def ApiErrorHandler(request : Request, exc : APIError):
+    del request
     return JSONResponse(
         status_code=exc.status_code,
         content={"error": {"code": exc.code, "message": exc.message}},
@@ -125,6 +132,7 @@ async def create_review(request: Request, payload: ReviewRequest, Background_tas
     if len(await request.body()) > MAX_PAYLOAD_BYTES:
         raise APIError("payload_too_large", "Request body exceeds 1 MiB.")
     patch = parse_diff(payload.diff) # parse the unified diff
+    chunks = chunk_patch(patch) # chunking
     job_id = uuid4().hex
     JOBS[job_id] = {
         "jobId": job_id,
@@ -132,14 +140,14 @@ async def create_review(request: Request, payload: ReviewRequest, Background_tas
         "findings": [],
         "usage": {
             "inputBytes": len(payload.diff.encode("utf-8")),
-            "chunks": 1,
+            "chunks": len(chunks),
             "cacheHit": False,
         },
-}
+    }
     Background_tasks.add_task( # append task to thread
         process_review,
         job_id,
-        patch,
+        chunks,
         payload.options.provider,
         payload.options.maxFindings,
     )
