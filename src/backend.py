@@ -15,6 +15,7 @@ from fastapi import APIRouter, Depends, FastAPI, Header, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.security.utils import get_authorization_scheme_param
 from contextlib import asynccontextmanager
 from src.checkDiff import parse_diff
 from src.mock_provider import run_mock_provider
@@ -129,6 +130,56 @@ async def lifespan(app: FastAPI):
 app = FastAPI(version=SERVICE_VERSION, lifespan=lifespan)
 bearer_scheme = HTTPBearer(auto_error=False)
 
+
+def is_valid_bearer_header(authorization: str | None) -> bool:
+    expected_token = os.getenv("API_BEARER_TOKEN")
+    scheme, supplied_token = get_authorization_scheme_param(authorization or "")
+    return bool(
+        expected_token
+        and scheme.lower() == "bearer"
+        and supplied_token
+        and secrets.compare_digest(supplied_token, expected_token)
+    )
+
+
+class V1AuthenticationMiddleware:
+    """Authenticate /v1 before FastAPI reads or validates the request body."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        path = scope.get("path", "")
+        if scope.get("type") == "http" and (path == "/v1" or path.startswith("/v1/")):
+            headers = {
+                key.lower(): value
+                for key, value in scope.get("headers", [])
+            }
+            raw_authorization = headers.get(b"authorization")
+            authorization = (
+                raw_authorization.decode("latin-1")
+                if raw_authorization is not None
+                else None
+            )
+            if not is_valid_bearer_header(authorization):
+                response = JSONResponse(
+                    status_code=401,
+                    content={
+                        "error": {
+                            "code": "unauthorized",
+                            "message": "A valid bearer token is required",
+                        }
+                    },
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+                await response(scope, receive, send)
+                return
+
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(V1AuthenticationMiddleware)
+
 # Validation for options
 class ReviewOptions(BaseModel):
     provider: Literal["mock", "llm"] = "mock"
@@ -242,13 +293,12 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
 
 # check for bearer token and compare it with the ones in env. Raised an error when the token is not the same or empty token
 async def require_bearer_token( credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)]) -> None:
-    expected_token = os.getenv("API_BEARER_TOKEN")
-    supplied_token = credentials.credentials if credentials is not None else ""
-
-    if ( not expected_token
-        or credentials is None
-        or credentials.scheme.lower() != "bearer"
-        or not secrets.compare_digest(supplied_token, expected_token)):
+    authorization = (
+        f"{credentials.scheme} {credentials.credentials}"
+        if credentials is not None
+        else None
+    )
+    if not is_valid_bearer_header(authorization):
         raise APIError("unauthorized", "A valid bearer token is required", headers={"WWW-Authenticate": "Bearer"})
 
 # adds v1 to the route, each v1 path is req to provide an bearer token

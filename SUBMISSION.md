@@ -2,9 +2,9 @@
 
 ## Service details
 
-- Base URL: https://your-service.example.com
-- Bearer token: <random-token>
-- Repository: https://github.com/your-org/ai-git-diff-service
+- Base URL: https://ai-git-diff-service-production.up.railway.app
+- Bearer token: provided separately to the evaluator
+- Repository: https://github.com/xiang2007/ai-git-diff-service
 
 ## Architecture
 
@@ -22,7 +22,7 @@ async job pipeline.
   in-memory event log.
 - Caching is keyed by the SHA-256 of the raw request body; idempotency keys map
   to a body hash and existing job id.
-- Deployment is a non-root container built and sync with `uv`.
+- Deployment is a non-root container built and synchronized with `uv`.
 
 ## Provider design
 
@@ -56,7 +56,8 @@ chunks and returns a normalized list of finding objects.
   job replays the same sequence.
 - Rate limiting and concurrency: 30 submissions per minute pass; excess gets
   429 with `Retry-After`; four jobs run concurrently and a fifth queues.
-- LLM degradation: missing credentials or an unreachable Gemini API produce a
+- LLM behavior: the Gemini path succeeds with the documented local
+  configuration; missing credentials or an unreachable Gemini API produce a
   failed job, not an unhandled exception.
 
 ## AI tools used
@@ -75,5 +76,6 @@ check avoids middleware lifecycle complexity without weakening the behavior.
 
 ## Next steps with more time
 
-- Add a full pytest suite and CI so contract probes run on every commit.
+- Run the contract test suite in CI on every commit and add deployment smoke
+  tests against a staging service.
 - Move job/cache state to Redis or a database for multi-instance deployments.
