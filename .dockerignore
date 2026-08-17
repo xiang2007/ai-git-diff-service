@@ -1,0 +1,12 @@
+.git
+.venv
+__pycache__
+**/__pycache__
+*.pyc
+.env
+.env.*
+.agents
+.codex
+tests
+README.md
+CANDIDATES-TASK.md
