@@ -19,6 +19,7 @@ from contextlib import asynccontextmanager
 from src.checkDiff import parse_diff
 from src.mock_provider import run_mock_provider
 from src.chunking import chunk_patch
+from src.rate_limiter import SlidingWindowRateLimiter
 
 logger = logging.getLogger(__name__)
 load_dotenv()
@@ -40,6 +41,10 @@ IDEMPOTENCY_KEYS: dict[str, tuple[str, str]] = {}
 JOB_REQUEST_HASHES: dict[str, str] = {}
 JOB_EVENTS: dict[str, list[str]] = {}
 JOB_EVENT_CONDITIONS: dict[str, asyncio.Condition] = {}
+SUBMISSION_RATE_LIMITER = SlidingWindowRateLimiter(
+    limit=30,
+    window_seconds=60,
+)
 
 
 def format_sse_event(event: str, data: dict) -> str:
@@ -258,6 +263,14 @@ async def create_review(
     raw_body = await request.body()
     if len(raw_body) > MAX_PAYLOAD_BYTES:
         raise APIError("payload_too_large", "Request body exceeds 1 MiB.")
+
+    retry_after = SUBMISSION_RATE_LIMITER.acquire()
+    if retry_after is not None:
+        raise APIError(
+            "rate_limited",
+            "Review submission rate limit exceeded.",
+            headers={"Retry-After": str(retry_after)},
+        )
 
     request_hash = hashlib.sha256(raw_body).hexdigest()
 
