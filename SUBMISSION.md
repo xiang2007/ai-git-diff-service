@@ -3,7 +3,7 @@
 ## Service details
 
 - Base URL: https://your-service.example.com
-- Bearer token: <redacted-long-random-token>
+- Bearer token: <random-token>
 - Repository: https://github.com/your-org/ai-git-diff-service
 
 ## Architecture
@@ -62,7 +62,7 @@ chunks and returns a normalized list of finding objects.
 
 ## AI tools used
 
-Codex was used to scaffold and review the FastAPI routes, auth dependency,
+Codex was used review the FastAPI routes, auth dependency,
 error handling, chunking, mock rules, Gemini provider, job lifecycle, and
 Docker setup. Generated code was tested against the contract with local
 scripts and adjusted where behavior diverged from the spec.
@@ -78,8 +78,3 @@ check avoids middleware lifecycle complexity without weakening the behavior.
 
 - Add a full pytest suite and CI so contract probes run on every commit.
 - Move job/cache state to Redis or a database for multi-instance deployments.
-- Add TTL/LRU eviction for caches and job state.
-- Add request IDs and structured logs for observability.
-- Generalize the LLM boundary behind a common provider interface for additional
-  vendors.
-- Harden startup configuration validation and pin container image digests.
