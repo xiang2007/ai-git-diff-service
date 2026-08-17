@@ -3,3 +3,4 @@ CANDIDATES-TASK.md
 *.pyc
 .env
 tests
+__pycache__

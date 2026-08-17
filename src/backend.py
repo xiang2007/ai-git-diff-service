@@ -19,6 +19,7 @@ from contextlib import asynccontextmanager
 from src.checkDiff import parse_diff
 from src.mock_provider import run_mock_provider
 from src.chunking import chunk_patch
+from src.gemini_provider import GeminiProvider, GeminiProviderError
 from src.rate_limiter import SlidingWindowRateLimiter
 
 logger = logging.getLogger(__name__)
@@ -142,14 +143,26 @@ async def process_review(job_id : str, chunks : list, provider : str, max_findin
     job = JOBS[job_id]
     job["status"] = "running"
     await publish_job_event(job_id, "status", {"status": "running"})
+    gemini_provider: GeminiProvider | None = None
     try:
-        if provider != "mock":
-            raise RuntimeError("LLM not configured") # haven't implemented llm
         findById: dict[str, dict] = {}
-        for chunk in chunks:
-            chunkFindings = await asyncio.to_thread(run_mock_provider, chunk)
-            for finding in chunkFindings:
-                findById[finding["id"]] = finding
+        if provider == "mock":
+            for chunk in chunks:
+                chunkFindings = await asyncio.to_thread(run_mock_provider, chunk)
+                for finding in chunkFindings:
+                    findById[finding["id"]] = finding
+        elif provider == "llm":
+            gemini_provider = GeminiProvider.from_env()
+            for chunk in chunks:
+                chunkFindings = await gemini_provider.review_chunk(chunk)
+                for finding in chunkFindings:
+                    findById[finding["id"]] = finding
+        else:
+            raise GeminiProviderError(
+                "provider_unavailable",
+                "The selected review provider is unavailable.",
+            )
+
         allFindings = list(findById.values())
         allFindings.sort(key=lambda finding:(finding["path"], finding["line"], finding["ruleId"]))
         job["findings"] = allFindings[:max_finding]
@@ -177,11 +190,27 @@ async def process_review(job_id : str, chunks : list, provider : str, max_findin
                     "chunks": job["usage"]["chunks"],
                 },
             }
-    except Exception:
+    except GeminiProviderError as exc:
         JOB_REQUEST_HASHES.pop(job_id, None)
-        logger.exception("Review jobs %s failed", job_id)
+        logger.warning("Review job %s failed with provider error %s", job_id, exc.code)
+        job["error"] = {"code": exc.code, "message": exc.public_message}
         job["status"] = "failed"
         await publish_job_event(job_id, "status", {"status": "failed"})
+    except Exception:
+        JOB_REQUEST_HASHES.pop(job_id, None)
+        logger.exception("Review job %s failed", job_id)
+        job["error"] = {
+            "code": "internal_error",
+            "message": "Review processing failed.",
+        }
+        job["status"] = "failed"
+        await publish_job_event(job_id, "status", {"status": "failed"})
+    finally:
+        if gemini_provider is not None:
+            try:
+                await gemini_provider.close()
+            except Exception:
+                logger.warning("Could not close Gemini client for job %s", job_id)
 
 @app.exception_handler(APIError)
 async def ApiErrorHandler(request : Request, exc : APIError):
