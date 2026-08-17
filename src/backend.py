@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import hashlib
+import json
 import logging
 import os
 import secrets
@@ -12,7 +13,7 @@ from typing import Annotated, Literal
 from dotenv import load_dotenv
 from fastapi import APIRouter, Depends, FastAPI, Header, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from contextlib import asynccontextmanager
 from src.checkDiff import parse_diff
@@ -37,6 +38,53 @@ JOB_QUEUE: asyncio.Queue[JobItem] = asyncio.Queue()
 RESULT_CACHE: dict[str, dict] = {}
 IDEMPOTENCY_KEYS: dict[str, tuple[str, str]] = {}
 JOB_REQUEST_HASHES: dict[str, str] = {}
+JOB_EVENTS: dict[str, list[str]] = {}
+JOB_EVENT_CONDITIONS: dict[str, asyncio.Condition] = {}
+
+
+def format_sse_event(event: str, data: dict) -> str:
+    payload = json.dumps(data, separators=(",", ":"), sort_keys=True)
+    return f"event: {event}\ndata: {payload}\n\n"
+
+
+def initialize_job_events(job_id: str) -> None:
+    JOB_EVENTS[job_id] = []
+    JOB_EVENT_CONDITIONS[job_id] = asyncio.Condition()
+
+
+async def publish_job_event(job_id: str, event: str, data: dict) -> None:
+    if job_id not in JOB_EVENTS:
+        initialize_job_events(job_id)
+
+    condition = JOB_EVENT_CONDITIONS[job_id]
+    async with condition:
+        JOB_EVENTS[job_id].append(format_sse_event(event, data))
+        condition.notify_all()
+
+
+async def stream_job_events(job_id: str):
+    event_index = 0
+    condition = JOB_EVENT_CONDITIONS[job_id]
+
+    while True:
+        async with condition:
+            await condition.wait_for(
+                lambda: (
+                    event_index < len(JOB_EVENTS[job_id])
+                    or JOBS[job_id]["status"] in {"done", "failed"}
+                )
+            )
+            pending_events = JOB_EVENTS[job_id][event_index:]
+            event_index += len(pending_events)
+
+        for event in pending_events:
+            yield event
+
+        if (
+            JOBS[job_id]["status"] in {"done", "failed"}
+            and event_index == len(JOB_EVENTS[job_id])
+        ):
+            return
 
 async def worker() -> None:
     while True:
@@ -88,6 +136,7 @@ class ReviewRequest(BaseModel):
 async def process_review(job_id : str, chunks : list, provider : str, max_finding : int) -> None:
     job = JOBS[job_id]
     job["status"] = "running"
+    await publish_job_event(job_id, "status", {"status": "running"})
     try:
         if provider != "mock":
             raise RuntimeError("LLM not configured") # haven't implemented llm
@@ -99,7 +148,20 @@ async def process_review(job_id : str, chunks : list, provider : str, max_findin
         allFindings = list(findById.values())
         allFindings.sort(key=lambda finding:(finding["path"], finding["line"], finding["ruleId"]))
         job["findings"] = allFindings[:max_finding]
+
+        for finding in job["findings"]:
+            await publish_job_event(job_id, "finding", finding)
+
         job["status"] = "done"
+        await publish_job_event(job_id, "status", {"status": "done"})
+        await publish_job_event(
+            job_id,
+            "done",
+            {
+                "total": len(job["findings"]),
+                "usage": copy.deepcopy(job["usage"]),
+            },
+        )
 
         request_hash = JOB_REQUEST_HASHES.pop(job_id, None)
         if request_hash is not None:
@@ -114,6 +176,7 @@ async def process_review(job_id : str, chunks : list, provider : str, max_findin
         JOB_REQUEST_HASHES.pop(job_id, None)
         logger.exception("Review jobs %s failed", job_id)
         job["status"] = "failed"
+        await publish_job_event(job_id, "status", {"status": "failed"})
 
 @app.exception_handler(APIError)
 async def ApiErrorHandler(request : Request, exc : APIError):
@@ -212,18 +275,32 @@ async def create_review(
     cached_result = RESULT_CACHE.get(request_hash)
     if cached_result is not None:
         job_id = uuid4().hex
+        cached_findings = copy.deepcopy(cached_result["findings"])[
+            :payload.options.maxFindings
+        ]
         JOBS[job_id] = {
             "jobId": job_id,
             "status": "done",
-            "findings": copy.deepcopy(cached_result["findings"])[
-                :payload.options.maxFindings
-            ],
+            "findings": cached_findings,
             "usage": {
                 "inputBytes": cached_result["usage"]["inputBytes"],
                 "chunks": cached_result["usage"]["chunks"],
                 "cacheHit": True,
             },
         }
+        initialize_job_events(job_id)
+        await publish_job_event(job_id, "status", {"status": "queued"})
+        for finding in cached_findings:
+            await publish_job_event(job_id, "finding", finding)
+        await publish_job_event(job_id, "status", {"status": "done"})
+        await publish_job_event(
+            job_id,
+            "done",
+            {
+                "total": len(cached_findings),
+                "usage": copy.deepcopy(JOBS[job_id]["usage"]),
+            },
+        )
         if idempotency_key is not None:
             IDEMPOTENCY_KEYS[idempotency_key] = (request_hash, job_id)
         return {"jobId": job_id, "status": "queued"}
@@ -241,6 +318,8 @@ async def create_review(
             "cacheHit": False,
         },
     }
+    initialize_job_events(job_id)
+    await publish_job_event(job_id, "status", {"status": "queued"})
     JOB_REQUEST_HASHES[job_id] = request_hash
     if idempotency_key is not None:
         IDEMPOTENCY_KEYS[idempotency_key] = (request_hash, job_id)
@@ -265,5 +344,23 @@ async def get_review(job_id: str) -> dict:
         )
 
     return job
+
+
+@v1_router.get("/reviews/{job_id}/stream", tags=["Operations"])
+async def stream_review(job_id: str) -> StreamingResponse:
+    if job_id not in JOBS:
+        raise APIError(
+            "not_found",
+            "Review job was not found.",
+        )
+
+    return StreamingResponse(
+        stream_job_events(job_id),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 app.include_router(v1_router)
